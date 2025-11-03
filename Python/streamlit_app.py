@@ -6,14 +6,14 @@ from math import sqrt
 import joblib
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-
+from pathlib import Path
 # -----------------------------
 # Config (match your training script)
 # -----------------------------
 RANDOM_STATE = 42
 TRAIN_PCT = 0.70
 DATA_FILE = Path("..") / "Data" / "LengthOfStay.csv"
-MODEL_DIR = Path("./models_sklearn_los")
+MODEL_DIR = Path(__file__).resolve().parent / "models_sklearn_los"
 
 TARGET = "lengthofstay"
 ID_COL = "eid"
