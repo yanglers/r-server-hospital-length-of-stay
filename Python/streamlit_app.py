@@ -12,7 +12,7 @@ from pathlib import Path
 # -----------------------------
 RANDOM_STATE = 42
 TRAIN_PCT = 0.70
-DATA_FILE = Path("..") / "Data" / "LengthOfStay.csv"
+DATA_FILE = Path("/Users/austinyang/r-server-hospital-length-of-stay/Data/LengthOfStay.csv")
 MODEL_DIR = Path(__file__).resolve().parent / "models_sklearn_los"
 
 TARGET = "lengthofstay"
