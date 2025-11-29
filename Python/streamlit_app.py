@@ -1,7 +1,8 @@
 # streamlit_app.py
 import os
-from pathlib import Path
 from math import sqrt
+from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -14,6 +15,7 @@ from sklearn.compose import ColumnTransformer
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.pipeline import Pipeline
 from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.inspection import permutation_importance
 
 # -----------------------------
 # Config (match training where possible)
@@ -51,7 +53,6 @@ ISSUE_INDICATORS = [
     "malnutrition",
 ]
 
-# Candidates for procedure and site / facility columns
 PROCEDURE_COL_CANDIDATES = [
     "procedure",
     "primaryprocedure",
@@ -65,10 +66,9 @@ SITE_COL_CANDIDATES = [
     "hospital",
 ]
 
-# Threshold for at-risk label on dashboard
-AT_RISK_THRESHOLD_DAYS = 5
+AT_RISK_THRESHOLD_DAYS = 5  # for dashboard risk band
 
-# Friendly labels for features (used in manual input + filters)
+# Friendly labels for UI
 FEATURE_LABELS = {
     "hematocrit": "Hematocrit (red blood cell % of blood)",
     "neutrophils": "Neutrophil count (white blood cells)",
@@ -101,7 +101,6 @@ FEATURE_LABELS = {
 def pretty_label(col: str) -> str:
     if col in FEATURE_LABELS:
         return FEATURE_LABELS[col]
-    # fall back to a simple title-cased column name
     return col.replace("_", " ").title()
 
 
@@ -153,7 +152,9 @@ def clean_fill(df: pd.DataFrame) -> pd.DataFrame:
     cols_to_consider = [c for c in df.columns if c not in protected]
 
     num_cols = df[cols_to_consider].select_dtypes(include=["number"]).columns.tolist()
-    cat_cols = df[cols_to_consider].select_dtypes(include=["object", "category"]).columns.tolist()
+    cat_cols = df[cols_to_consider].select_dtypes(
+        include=["object", "category"]
+    ).columns.tolist()
 
     if num_cols:
         df[num_cols] = df[num_cols].fillna(df[num_cols].mean(numeric_only=True))
@@ -172,13 +173,12 @@ def clean_fill(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def feature_engineer(df: pd.DataFrame) -> pd.DataFrame:
-    # z-score selected continuous columns (dataset stats)
+    # z-score selected continuous columns
     present_cont = [c for c in CONTINUOUS_TO_STANDARDIZE if c in df.columns]
     for c in present_cont:
         mean, std = df[c].mean(), df[c].std(ddof=0)
         df[c] = (df[c] - mean) / (std if std else 1.0)
 
-    # number_of_issues = sum of indicators, cast to string
     present_issue = [c for c in ISSUE_INDICATORS if c in df.columns]
     if present_issue:
         df["number_of_issues"] = (
@@ -204,7 +204,7 @@ def prepare(df: pd.DataFrame):
 
 
 # -----------------------------
-# Model loading & first-run fallback training
+# Model loading & fallback training
 # -----------------------------
 @st.cache_resource
 def load_models():
@@ -248,7 +248,7 @@ def quick_train_and_save(df_raw: pd.DataFrame) -> float:
     pipe.fit(Xtr, ytr)
 
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
-    joblib.dump(pipe, MODEL_DIR / "GBT_model.joblib")
+    joblib.dump(pipe, MODEL_DIR / "GBT_40_model.joblib")
 
     rmse = float(np.sqrt(mean_squared_error(yte, pipe.predict(Xte))))
     return rmse
@@ -270,8 +270,19 @@ def score_and_render(base_df: pd.DataFrame, X: pd.DataFrame, pipe) -> pd.DataFra
     return out
 
 
-def explain_prediction(pipe, X_row: pd.DataFrame):
-    """Show either local contributions (for linear) or global importances (trees)."""
+def explain_prediction(
+    pipe,
+    X_row: pd.DataFrame,
+    X_background: Optional[pd.DataFrame] = None,
+    y_background: Optional[pd.Series] = None,
+    max_features: int = 10,
+):
+    """
+    Show either:
+    - local contributions for linear models (coef_),
+    - global feature importances for tree-based models (feature_importances_),
+    - or permutation importance for any fallback model (e.g., neural net).
+    """
     st.subheader("Top contributing factors")
 
     model = pipe.named_steps.get("model")
@@ -280,33 +291,71 @@ def explain_prediction(pipe, X_row: pd.DataFrame):
         st.info("Cannot introspect this model pipeline.")
         return
 
-    Xt = prep.transform(X_row)
+    Xt_row = prep.transform(X_row)
     try:
         feat_names = prep.get_feature_names_out()
     except Exception:
-        feat_names = np.array([f"f{i}" for i in range(Xt.shape[1])])
+        feat_names = np.array([f"f{i}" for i in range(Xt_row.shape[1])])
 
+    # 1) Linear models: local contributions
     if hasattr(model, "coef_"):
         coef = np.asarray(model.coef_).ravel()
-        contrib = Xt.reshape(-1) * coef
+        contrib = Xt_row.reshape(-1) * coef
         df_contrib = pd.DataFrame(
             {"feature_encoded": feat_names, "contribution": contrib}
         )
         df_contrib["abs_contribution"] = df_contrib["contribution"].abs()
-        df_contrib = df_contrib.sort_values("abs_contribution", ascending=False).head(10)
-        st.caption("Local contributions from a linear-style model.")
+        df_contrib = df_contrib.sort_values(
+            "abs_contribution", ascending=False
+        ).head(max_features)
+
+        st.caption(
+            "Local contributions from a linear model "
+            "(prediction ≈ intercept + Σ feature · coefficient)."
+        )
         st.dataframe(df_contrib[["feature_encoded", "contribution"]])
-    elif hasattr(model, "feature_importances_"):
+        return
+
+    # 2) Tree-based models: global feature_importances_
+    if hasattr(model, "feature_importances_"):
         importances = np.asarray(model.feature_importances_)
         df_imp = pd.DataFrame(
             {"feature_encoded": feat_names, "importance": importances}
         ).sort_values("importance", ascending=False)
-        st.caption("Global feature importances from this tree-based model.")
-        st.dataframe(df_imp.head(10))
-    else:
+
+        st.caption("Global feature importances from a tree-based model.")
+        st.dataframe(df_imp.head(max_features))
+        return
+
+    # 3) Fallback: permutation importance
+    if X_background is None or y_background is None:
         st.info(
-            "This model type does not expose per-feature contributions or importances."
+            "This model does not expose coefficients or feature importances, "
+            "and no background data was provided to compute permutation importance."
         )
+        return
+
+    X_bg = X_background.copy()
+    y_bg = y_background.copy()
+    if len(X_bg) > 2000:
+        sample_idx = np.random.choice(len(X_bg), size=2000, replace=False)
+        X_bg = X_bg.iloc[sample_idx]
+        y_bg = y_bg.iloc[sample_idx]
+
+    Xt_bg = prep.transform(X_bg)
+    result = permutation_importance(
+        model, Xt_bg, y_bg, n_repeats=5, random_state=0, n_jobs=-1
+    )
+
+    df_perm = pd.DataFrame(
+        {
+            "feature_encoded": feat_names,
+            "importance": result.importances_mean,
+        }
+    ).sort_values("importance", ascending=False)
+
+    st.caption("Global permutation importance (works for any model).")
+    st.dataframe(df_perm.head(max_features))
 
 
 def show_procedure_context(
@@ -351,7 +400,6 @@ def show_procedure_context(
                 "This predicted stay looks unusual for this procedure (|z| > 2)."
             )
 
-    # Distribution plot
     data_proc = df_prep[df_prep[proc_col] == proc_val][TARGET].dropna()
     if len(data_proc) >= 5:
         bins = min(20, max(5, int(len(data_proc) ** 0.5)))
@@ -366,6 +414,12 @@ def show_procedure_context(
         st.info("Not enough historical data to show a distribution for this procedure.")
 
 
+def format_model_name(key: str, pipe) -> str:
+    model = pipe.named_steps.get("model")
+    cls = model.__class__.__name__ if model is not None else "Unknown"
+    return f"{key} ({cls})"
+
+
 # -----------------------------
 # UI
 # -----------------------------
@@ -375,9 +429,9 @@ st.title("Length of Stay Dashboard")
 models = load_models()
 if not models:
     st.info("No saved models found in ./models_sklearn_los.")
-    df_raw = load_raw()
-    if st.button("Train a quick GBT model now"):
-        rmse = quick_train_and_save(df_raw)
+    df_raw_tmp = load_raw()
+    if st.button("Train a quick baseline GBT model now"):
+        rmse = quick_train_and_save(df_raw_tmp)
         st.success(
             f"Model trained and saved. Test RMSE ≈ {rmse:.3f}. Click **Rerun** to load it."
         )
@@ -385,11 +439,10 @@ if not models:
     else:
         st.stop()
 
-# Data for inference/diagnostics
+# Data for inference / diagnostics
 df_raw = load_raw()
 df_prep, X_all, y_all, feature_cols = prepare(df_raw)
 
-# Procedure & site stats for UI
 PROC_COL = next((c for c in PROCEDURE_COL_CANDIDATES if c in df_prep.columns), None)
 SITE_COL = next((c for c in SITE_COL_CANDIDATES if c in df_prep.columns), None)
 
@@ -398,12 +451,17 @@ if PROC_COL:
 else:
     proc_stats = None
 
-# Train/test split to show metrics
 X_train, X_test, y_train, y_test, idx_train, idx_test = train_test_split(
     X_all, y_all, df_prep.index, train_size=TRAIN_PCT, random_state=RANDOM_STATE
 )
 
-model_key = st.sidebar.selectbox("Model", sorted(models.keys()), index=0)
+model_keys = sorted(models.keys())
+model_key = st.sidebar.selectbox(
+    "Model",
+    model_keys,
+    index=0,
+    format_func=lambda k: format_model_name(k, models[k]),
+)
 pipe = models[model_key]
 
 st.sidebar.markdown("### View")
@@ -412,17 +470,15 @@ mode = st.sidebar.radio(
 )
 
 # -----------------------------
-# Mode: Pick a patient (dashboard-style view)
+# Mode: Pick a patient (dashboard)
 # -----------------------------
 if mode == "Pick a patient":
-    # Layout similar to a dashboard: left filters, right main panel
     filters_col, main_panel = st.columns([1, 3])
 
-    # ---------- Filters ----------
+    # Left: filters
     with filters_col:
         st.markdown("#### Filters")
 
-        # Procedure filter
         if PROC_COL and PROC_COL in df_prep.columns:
             proc_options = ["All procedures"] + sorted(
                 df_prep[PROC_COL].dropna().astype(str).unique().tolist()
@@ -431,7 +487,6 @@ if mode == "Pick a patient":
         else:
             proc_filter = "All procedures"
 
-        # Site filter
         if SITE_COL and SITE_COL in df_prep.columns:
             site_options = ["All sites"] + sorted(
                 df_prep[SITE_COL].dropna().astype(str).unique().tolist()
@@ -440,7 +495,6 @@ if mode == "Pick a patient":
         else:
             site_filter = "All sites"
 
-        # Simple comorbidity filters based on ISSUE_INDICATORS
         st.markdown("##### Comorbidities")
         issue_filters = {}
         present_issue_cols = [c for c in ISSUE_INDICATORS if c in df_prep.columns]
@@ -451,7 +505,6 @@ if mode == "Pick a patient":
         st.markdown("##### Search")
         search_text = st.text_input("Search patient / case #", value="")
 
-    # ---------- Apply filters ----------
     subset = df_prep.loc[idx_test].copy()
 
     if PROC_COL and proc_filter != "All procedures":
@@ -474,7 +527,7 @@ if mode == "Pick a patient":
             st.warning("No patients match the current filters.")
         st.stop()
 
-    # ---------- Score filtered cohort for dashboard KPIs ----------
+    # Score filtered cohort
     X_subset = X_all.loc[subset.index]
     base_cols_queue = [c for c in [ID_COL, "vdate", PROC_COL, TARGET] if c in df_prep.columns]
     scored_subset = score_and_render(
@@ -487,27 +540,20 @@ if mode == "Pick a patient":
     )
     total_cases = len(scored_subset)
 
-    # Risk band for queue
     scored_subset["Risk band"] = pd.cut(
         scored_subset["lengthofstay_Pred"],
         bins=[-np.inf, 3, AT_RISK_THRESHOLD_DAYS, np.inf],
         labels=["Low", "Medium", "High"],
     )
 
-    # ---------- Main panel ----------
     with main_panel:
-        # Top KPIs row
         st.markdown("#### Overview (filtered cohort)")
         kpi1, kpi2, kpi3 = st.columns(3)
         with kpi1:
-            st.metric(
-                "Median predicted LOS",
-                f"{median_los:.1f} days",
-            )
+            st.metric("Median predicted LOS", f"{median_los:.1f} days")
         with kpi2:
             st.metric(
-                f"At-risk cases (≥ {AT_RISK_THRESHOLD_DAYS} days)",
-                f"{at_risk_cases}",
+                f"At-risk cases (≥ {AT_RISK_THRESHOLD_DAYS} days)", f"{at_risk_cases}"
             )
         with kpi3:
             st.metric("Cases in view", f"{total_cases}")
@@ -543,7 +589,7 @@ if mode == "Pick a patient":
 
         st.dataframe(queue_display, height=350)
 
-        # Choose a case for detail view
+        # Select case for detail
         if ID_COL in scored_subset.columns:
             case_choices = scored_subset[ID_COL].astype(str).tolist()
             selected_case = st.selectbox("Select case for detailed view", case_choices)
@@ -553,7 +599,6 @@ if mode == "Pick a patient":
         else:
             row_idx = scored_subset.index[0]
 
-        # Build row data + prediction for detail card
         row_X = X_all.loc[[row_idx]]
         base_cols_detail = [
             c
@@ -571,13 +616,11 @@ if mode == "Pick a patient":
         row_base = df_prep.loc[[row_idx], base_cols_detail]
         scored_row = score_and_render(row_base, row_X, pipe)
 
-        # Two-column case view (card + explanations)
         st.markdown("---")
         case_left, case_right = st.columns([1, 1])
 
         with case_left:
             st.markdown("#### Selected case")
-            # Big predicted LOS number
             pred_los = float(scored_row["lengthofstay_Pred_Rounded"].iloc[0])
             st.markdown(
                 f"<h2 style='margin-bottom:0'>{pred_los:.1f} days</h2>"
@@ -585,7 +628,6 @@ if mode == "Pick a patient":
                 unsafe_allow_html=True,
             )
 
-            # Expected discharge date
             if "discharged_Pred" in scored_row.columns:
                 discharge_date = scored_row["discharged_Pred"].iloc[0]
                 if pd.notnull(discharge_date):
@@ -594,13 +636,11 @@ if mode == "Pick a patient":
                         value=str(discharge_date.date()),
                     )
 
-            # Basic demographics / procedure
             st.markdown("##### Patient snapshot")
             info_rows = []
             for col in ["age", "gender", "bmi", PROC_COL]:
                 if col in scored_row.columns:
                     info_rows.append((pretty_label(col), str(scored_row[col].iloc[0])))
-
             if info_rows:
                 info_df = pd.DataFrame(
                     info_rows, columns=["Attribute", "Value"]
@@ -608,12 +648,12 @@ if mode == "Pick a patient":
                 st.table(info_df)
 
         with case_right:
-            # Procedure name + avg LOS + distribution
             if PROC_COL and proc_stats is not None:
                 show_procedure_context(df_prep, PROC_COL, proc_stats, row_idx, scored_row)
 
-            # Components impacting prediction
-            explain_prediction(pipe, row_X)
+            explain_prediction(
+                pipe, row_X, X_background=X_train, y_background=y_train
+            )
 
 # -----------------------------
 # Mode: Upload CSV
@@ -666,7 +706,9 @@ elif mode == "Diagnostics":
     st.scatter_chart(show)
 
     st.subheader("Global feature importance / contributions")
-    explain_prediction(pipe, X_test.head(1))
+    explain_prediction(
+        pipe, X_test.head(1), X_background=X_test, y_background=y_test
+    )
 
 # -----------------------------
 # Mode: Manual input (demo mode)
@@ -677,18 +719,16 @@ else:  # "Manual input"
         "Defaults come from typical values in the dataset."
     )
 
-    # Two-column layout: left form, right result card
     form_col, result_col = st.columns([2, 1])
 
     with form_col:
-        # Visit date + optional ID
-        visit_date = st.date_input("Admission date", value=pd.Timestamp.today().date())
-        base_row = {}
-        base_row["vdate"] = pd.to_datetime(visit_date)
+        visit_date = st.date_input(
+            "Admission date", value=pd.Timestamp.today().date()
+        )
+        base_row = {"vdate": pd.to_datetime(visit_date)}
         if ID_COL in df_raw.columns:
             base_row[ID_COL] = st.text_input("Patient ID", value="DEMO-1")
 
-        # We collect manual values for all feature columns except number_of_issues
         manual_feature_cols = [c for c in feature_cols if c != "number_of_issues"]
 
         num_cols = df_prep[manual_feature_cols].select_dtypes(
@@ -702,9 +742,8 @@ else:  # "Manual input"
         manual_values = {}
         for col in num_cols:
             col_median = float(df_prep[col].median())
-            label = pretty_label(col)
             manual_values[col] = st.number_input(
-                label, value=col_median, key=f"num_{col}"
+                pretty_label(col), value=col_median, key=f"num_{col}"
             )
 
         st.markdown("#### Diagnoses and other factors")
@@ -721,7 +760,6 @@ else:  # "Manual input"
         predict_clicked = st.button("Predict length of stay")
 
     if predict_clicked:
-        # Build a one-row raw dataframe with manual values
         manual_row_dict = {c: np.nan for c in df_raw.columns}
         for k, v in base_row.items():
             if k in manual_row_dict:
@@ -731,8 +769,6 @@ else:  # "Manual input"
                 manual_row_dict[k] = v
 
         df_manual_raw = pd.DataFrame([manual_row_dict])
-
-        # Append to raw dataset so that cleaning/standardization uses dataset stats
         df_aug = pd.concat([df_raw, df_manual_raw], ignore_index=True)
         df_aug_prep, X_aug, _, _ = prepare(df_aug)
 
@@ -741,7 +777,6 @@ else:  # "Manual input"
 
         base_cols = [c for c in [ID_COL, "vdate", TARGET, PROC_COL] if c in df_aug_prep.columns]
         base_df_manual = df_aug_prep.loc[[manual_idx], base_cols]
-
         scored_manual = score_and_render(base_df_manual, X_manual, pipe)
 
         with result_col:
@@ -761,7 +796,6 @@ else:  # "Manual input"
                         value=str(discharge_date.date()),
                     )
 
-            # Procedure context (avg LOS + distribution)
             if PROC_COL and proc_stats is not None and PROC_COL in df_aug_prep.columns:
                 show_procedure_context(
                     df_aug_prep,
@@ -771,5 +805,6 @@ else:  # "Manual input"
                     scored_manual,
                 )
 
-            # Components impacting prediction
-            explain_prediction(pipe, X_manual)
+            explain_prediction(
+                pipe, X_manual, X_background=X_all, y_background=y_all
+            )
