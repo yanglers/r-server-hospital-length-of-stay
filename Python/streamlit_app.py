@@ -2,7 +2,6 @@
 import os
 from math import sqrt
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -91,12 +90,13 @@ FEATURE_LABELS = {
     "fibrosisandother": "Pulmonary fibrosis / other lung disease",
     "malnutrition": "Malnutrition",
     "gender": "Gender",
-    "rcount": "Readmission count",
+    "rcount": "Number of prior visits (readmission count)",
     "secondarydiagnosisnonicd9": "Secondary diagnosis (non-ICD9)",
     "number_of_issues": "Number of comorbid conditions",
     "facid": "Clinic / hospital site",
     "age": "Age (years)",
 }
+
 
 def pretty_label(col: str) -> str:
     if col in FEATURE_LABELS:
@@ -272,9 +272,9 @@ def score_and_render(base_df: pd.DataFrame, X: pd.DataFrame, pipe) -> pd.DataFra
 
 def explain_prediction(
     pipe,
-    X_row: pd.DataFrame,
-    X_background: Optional[pd.DataFrame] = None,
-    y_background: Optional[pd.Series] = None,
+    X_row,
+    X_background=None,
+    y_background=None,
     max_features: int = 10,
 ):
     """
@@ -455,19 +455,27 @@ X_train, X_test, y_train, y_test, idx_train, idx_test = train_test_split(
     X_all, y_all, df_prep.index, train_size=TRAIN_PCT, random_state=RANDOM_STATE
 )
 
+# ----- MODEL SELECTION (core feature) -----
+st.sidebar.markdown("### Model selection")
 model_keys = sorted(models.keys())
 model_key = st.sidebar.selectbox(
-    "Model",
+    "Choose model",
     model_keys,
     index=0,
     format_func=lambda k: format_model_name(k, models[k]),
 )
 pipe = models[model_key]
+st.sidebar.markdown(
+    f"**Current model:**\n\n{format_model_name(model_key, pipe)}"
+)
 
+# ----- VIEW MODE -----
 st.sidebar.markdown("### View")
 mode = st.sidebar.radio(
     "Mode", ["Pick a patient", "Upload CSV", "Diagnostics", "Manual input"], index=0
 )
+
+st.caption(f"Using model: {format_model_name(model_key, pipe)}")
 
 # -----------------------------
 # Mode: Pick a patient (dashboard)
@@ -731,20 +739,44 @@ else:  # "Manual input"
 
         manual_feature_cols = [c for c in feature_cols if c != "number_of_issues"]
 
-        num_cols = df_prep[manual_feature_cols].select_dtypes(
+        # Split numeric into binary (0/1) vs continuous for UI
+        num_all = df_prep[manual_feature_cols].select_dtypes(
             exclude=["object", "category"]
         ).columns
         cat_cols = df_prep[manual_feature_cols].select_dtypes(
             include=["object", "category"]
         ).columns
 
-        st.markdown("#### Clinical measurements")
+        binary_cols = []
+        for col in num_all:
+            vals = df_prep[col].dropna().unique()
+            if len(vals) == 0:
+                continue
+            # treat as binary if values subset of {0,1} (allow float 0.0/1.0)
+            val_set = set(np.unique(vals))
+            if val_set.issubset({0, 1}) or val_set.issubset({0.0, 1.0}):
+                binary_cols.append(col)
+
+        cont_cols = [c for c in num_all if c not in binary_cols]
+
         manual_values = {}
-        for col in num_cols:
+
+        st.markdown("#### Clinical measurements")
+        for col in cont_cols:
             col_median = float(df_prep[col].median())
             manual_values[col] = st.number_input(
                 pretty_label(col), value=col_median, key=f"num_{col}"
             )
+
+        st.markdown("#### Binary conditions (0 / 1)")
+        for col in binary_cols:
+            # default based on majority in data
+            mean_val = df_prep[col].mean()
+            default_on = bool(mean_val >= 0.5)
+            checked = st.checkbox(
+                pretty_label(col), value=default_on, key=f"bin_{col}"
+            )
+            manual_values[col] = 1 if checked else 0
 
         st.markdown("#### Diagnoses and other factors")
         for col in cat_cols:
